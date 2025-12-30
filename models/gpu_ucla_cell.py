@@ -1,195 +1,192 @@
 import cupy as cp
-import numpy as np
-
 
 # =============================================================================
-# Fused Kernels (优化核心：融合内核)
+# Single Fused Kernel for Whole Cell Model (Complete Physics)
 # =============================================================================
+# 将所有离子电流计算和状态更新合并到一个 C++ 内核中，极大减少 GPU 启动开销
 
-@cp.fuse()
-def _fused_comp_ina(v, xh, xj, xm, xnai, shift_h, dt, FRT, XNAO, GNA):
-    """融合后的钠电流计算内核"""
-    # 1. 计算钠平衡电位
-    ena = (1.0 / FRT) * cp.log(XNAO / xnai)
+ucla_kernel_source = r'''
+extern "C" __global__ void update_ucla_cell_kernel(
+    float* v, float* xm, float* xh, float* xj, 
+    float* xr, float* xs1, float* xs2, 
+    float* xtof, float* ytof, float* xtos, float* ytos, float* rtos,
+    float* xnai, float* ci,
+    const float* Jncx_ptr, const float* Ilcc_ptr,
+    const float istim, const float dt,
+    const float FRT, const float XNAO, const float XKI, const float XKO,
+    const float GNA, const float GKR, const float GKS, const float GK1, 
+    const float GNAK, const float GTOS, const float GTOF, const float WCA
+) {
+    // 单细胞模型，通常只有 idx=0 有效
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx > 0) return; 
 
-    # 2. 临时调整电压
-    v_adj = v - shift_h
+    // 读取当前状态
+    float _v = v[idx];
+    float _xnai = xnai[idx];
+    float _ci = ci[idx];
 
-    # 3. 计算门控变量速率 (直接使用数学公式)
-    a = 1.0 - 1.0 / (1.0 + cp.exp(-(v + 40.0) / 0.24))
+    // =================================================================
+    // 1. INa (Sodium Current)
+    // =================================================================
+    float ena = (1.0f / FRT) * logf(XNAO / _xnai);
 
-    # h 门控
-    ah = a * 0.135 * cp.exp((80.0 + v_adj) / (-6.8))
-    bh = (1.0 - a) / (0.13 * (1.0 + cp.exp((v_adj + 10.66) / (-11.1)))) + \
-         a * (3.56 * cp.exp(0.079 * v_adj) + 3.1e5 * cp.exp(0.35 * v_adj))
+    // m-gate
+    float val_m = _v + 47.13f;
+    float am = (abs(val_m) < 0.01f) ? 3.2f : (0.32f * val_m / (1.0f - expf(-0.1f * val_m)));
+    float bm = 0.08f * expf(-_v / 11.0f);
 
-    # j 门控
-    aj = a * (-1.2714e5 * cp.exp(0.2444 * v_adj) - 3.474e-5 * cp.exp(-0.04391 * v_adj)) * \
-         (v_adj + 37.78) / (1.0 + cp.exp(0.311 * (v_adj + 79.23)))
-    bj = (1.0 - a) * (0.3 * cp.exp(-2.535e-7 * v_adj) / (1.0 + cp.exp(-0.1 * (v_adj + 32.0)))) + \
-         a * (0.1212 * cp.exp(-0.01052 * v_adj) / (1.0 + cp.exp(-0.1378 * (v_adj + 40.14))))
+    // h-gate
+    float ah, bh;
+    if (_v >= -40.0f) {
+        ah = 0.0f;
+        bh = 1.0f / (0.13f * (1.0f + expf((_v + 10.66f) / -11.1f)));
+    } else {
+        ah = 0.135f * expf((80.0f + _v) / -6.8f);
+        bh = 3.56f * expf(0.079f * _v) + 3.1e5f * expf(0.35f * _v);
+    }
 
-    # m 门控 (处理分母为0的奇点)
-    val_m = v + 47.13
-    am = cp.where(cp.abs(val_m) < 0.01,
-                  3.2,
-                  0.32 * val_m / (1.0 - cp.exp(-0.1 * val_m)))
-    bm = 0.08 * cp.exp(-v / 11.0)
+    // j-gate
+    float aj, bj;
+    if (_v >= -40.0f) {
+        aj = 0.0f;
+        bj = 0.3f * expf(-2.535e-7f * _v) / (1.0f + expf(-0.1f * (_v + 32.0f)));
+    } else {
+        aj = (-1.2714e5f * expf(0.2444f * _v) - 3.474e-5f * expf(-0.04391f * _v)) * (_v + 37.78f) / (1.0f + expf(0.311f * (_v + 79.23f)));
+        bj = 0.1212f * expf(-0.01052f * _v) / (1.0f + expf(-0.1378f * (_v + 40.14f)));
+    }
 
-    # 4. Rush-Larsen 更新状态
-    tauh = 1.0 / (ah + bh)
-    xh_inf = ah * tauh
-    xh_new = xh_inf - (xh_inf - xh) * cp.exp(-dt / tauh)
+    // Rush-Larsen Update for INa gates
+    float taum = 1.0f / (am + bm); 
+    float minf = am * taum; 
+    float xm_new = minf - (minf - xm[idx]) * expf(-dt / taum);
 
-    tauj = 1.0 / (aj + bj)
-    xj_inf = aj * tauj
-    xj_new = xj_inf - (xj_inf - xj) * cp.exp(-dt / tauj)
+    float tauh = 1.0f / (ah + bh); 
+    float hinf = ah * tauh; 
+    float xh_new = hinf - (hinf - xh[idx]) * expf(-dt / tauh);
 
-    taum = 1.0 / (am + bm)
-    xm_inf = am * taum
-    xm_new = xm_inf - (xm_inf - xm) * cp.exp(-dt / taum)
+    float tauj = 1.0f / (aj + bj); 
+    float jinf = aj * tauj; 
+    float xj_new = jinf - (jinf - xj[idx]) * expf(-dt / tauj);
 
-    # 5. 计算电流
-    ina = GNA * xh_new * xj_new * (xm_new ** 3) * (v - ena)
+    float ina = GNA * xh_new * xj_new * xm_new * xm_new * xm_new * (_v - ena);
 
-    return ina, xh_new, xj_new, xm_new
+    // =================================================================
+    // 2. IKr (Rapid Delayed Rectifier Potassium Current)
+    // =================================================================
+    float ek = (1.0f / FRT) * logf(XKO / XKI);
 
+    float val_k1 = _v + 7.0f;
+    float xkrv1 = (abs(val_k1) < 0.001f) ? (0.00138f / 0.123f) : (0.00138f * val_k1 / (1.0f - expf(-0.123f * val_k1)));
 
-@cp.fuse()
-def _fused_comp_ikr(v, xr, dt, FRT, XKO, XKI, GKR):
-    """融合后的IKr计算内核"""
-    ek = (1.0 / FRT) * cp.log(XKO / XKI)
+    float val_k2 = _v + 10.0f;
+    float xkrv2 = (abs(val_k2) < 0.001f) ? (0.00061f / 0.145f) : (0.00061f * val_k2 / (expf(0.145f * val_k2) - 1.0f));
 
-    # 门控变量速率 (处理奇点)
-    val_k1 = v + 7.0
-    xkrv1 = cp.where(cp.abs(val_k1) < 0.001 / 0.123,
-                     0.00138 / 0.123,
-                     0.00138 * val_k1 / (1.0 - cp.exp(-0.123 * val_k1)))
+    float taukr = 1.0f / (xkrv1 + xkrv2);
+    float xrinf = 1.0f / (1.0f + expf(-(_v + 50.0f) / 7.5f));
+    float xr_new = xrinf - (xrinf - xr[idx]) * expf(-dt / taukr);
 
-    val_k2 = v + 10.0
-    xkrv2 = cp.where(cp.abs(val_k2) < 0.001 / 0.145,
-                     0.00061 / 0.145,
-                     0.00061 * val_k2 / (cp.exp(0.145 * val_k2) - 1.0))
+    float rg = 1.0f / (1.0f + expf((_v + 33.0f) / 22.4f));
+    float ikr = GKR * sqrtf(XKO / 5.4f) * xr_new * rg * (_v - ek);
 
-    taukr = 1.0 / (xkrv1 + xkrv2)
-    xr_inf = 1.0 / (1.0 + cp.exp(-(v + 50.0) / 7.5))
-    xr_new = xr_inf - (xr_inf - xr) * cp.exp(-dt / taukr)
+    // =================================================================
+    // 3. IKs (Slow Delayed Rectifier Potassium Current)
+    // =================================================================
+    float prnak = 0.01833f;
+    float eks = (1.0f / FRT) * logf((XKO + prnak * XNAO) / (XKI + prnak * _xnai));
 
-    rg = 1.0 / (1.0 + cp.exp((v + 33.0) / 22.4))
-    ikr = GKR * cp.sqrt(XKO / 5.4) * xr_new * rg * (v - ek)
+    float xs1ss = 1.0f / (1.0f + expf(-(_v - 1.5f) / 16.7f));
+    float val_tau = _v + 30.0f;
+    float tauxs1;
+    if (abs(val_tau) < 0.001f) {
+        tauxs1 = 1.0f / (0.0000719f / 0.148f + 0.000131f / 0.0687f);
+    } else {
+        tauxs1 = 1.0f / (0.0000719f * val_tau / (1.0f - expf(-0.148f * val_tau)) + 
+                         0.000131f * val_tau / (expf(0.0687f * val_tau) - 1.0f));
+    }
+    float tauxs2 = 4.0f * tauxs1;
 
-    return ikr, xr_new
+    float xs1_new = xs1ss - (xs1ss - xs1[idx]) * expf(-dt / tauxs1);
+    float xs2_new = xs1ss - (xs1ss - xs2[idx]) * expf(-dt / tauxs2); 
 
+    float gksx = 0.433f * (1.0f + 0.8f / (1.0f + powf(0.5f / _ci, 3.0f)));
+    float iks = GKS * gksx * xs1_new * xs2_new * (_v - eks);
 
-@cp.fuse()
-def _fused_comp_iks(v, xs1, xs2, ci, xnai, dt, FRT, XKO, XNAO, XKI, GKS):
-    """融合后的IKs计算内核"""
-    prnak = 0.01833
-    eks = (1.0 / FRT) * cp.log((XKO + prnak * XNAO) / (XKI + prnak * xnai))
+    // =================================================================
+    // 4. IK1 (Inward Rectifier Potassium Current)
+    // =================================================================
+    float aki = 1.02f / (1.0f + expf(0.2385f * (_v - ek - 59.215f)));
+    float bki = (0.49124f * expf(0.08032f * (_v - ek + 5.476f)) + 
+                 expf(0.06175f * (_v - ek - 594.31f))) / 
+                (1.0f + expf(-0.5143f * (_v - ek + 4.753f)));
+    float xkin = aki / (aki + bki);
+    float ik1 = GK1 * sqrtf(XKO / 5.4f) * xkin * (_v - ek);
 
-    xs1ss = 1.0 / (1.0 + cp.exp(-(v - 1.5) / 16.7))
-    xs2ss = xs1ss
+    // =================================================================
+    // 5. INaK (Sodium-Potassium Pump Current)
+    // =================================================================
+    float sigma = (expf(XNAO / 67.3f) - 1.0f) / 7.0f;
+    float fnak = 1.0f / (1.0f + 0.1245f * expf(-0.1f * _v * FRT) + 0.0365f * sigma * expf(-_v * FRT));
+    float inak = GNAK * fnak * (1.0f / (1.0f + powf(12.0f / _xnai, 1.0f))) * (XKO / (XKO + 1.5f));
 
-    val_tau = v + 30.0
-    # 复杂的tau计算
-    tauxs1 = cp.where(
-        cp.abs(val_tau) < 0.001 / 0.148,
-        1.0 / (0.0000719 / 0.148 + 0.000131 / 0.0687),
-        1.0 / (0.0000719 * val_tau / (1.0 - cp.exp(-0.148 * val_tau)) +
-               0.000131 * val_tau / (cp.exp(0.0687 * val_tau) - 1.0))
-    )
-    tauxs2 = 4.0 * tauxs1
+    // =================================================================
+    // 6. Ito (Transient Outward Potassium Current)
+    // =================================================================
+    float rt1 = -(_v + 3.0f) / 15.0f;
+    float rt2 = (_v + 33.5f) / 10.0f;
+    float rt3 = (_v + 60.0f) / 10.0f;
 
-    xs1_new = xs1ss - (xs1ss - xs1) * cp.exp(-dt / tauxs1)
-    xs2_new = xs2ss - (xs2ss - xs2) * cp.exp(-dt / tauxs2)
+    float xtos_inf = 1.0f / (1.0f + expf(rt1));
+    float ytos_inf = 1.0f / (1.0f + expf(rt2));
+    float rs_inf = 1.0f / (1.0f + expf(rt2)); 
 
-    gksx = 0.433 * (1.0 + 0.8 / (1.0 + (0.5 / ci) ** 3))
-    iks = GKS * gksx * xs1_new * xs2_new * (v - eks)
+    float trs = (2800.0f - 500.0f) / (1.0f + expf(rt3)) + 720.0f;
+    float txs = 9.0f / (1.0f + expf(-rt1)) + 0.5f;
+    float tys = 3000.0f / (1.0f + expf(rt3)) + 30.0f;
 
-    return iks, xs1_new, xs2_new
+    float xtos_new = xtos_inf - (xtos_inf - xtos[idx]) * expf(-dt / txs);
+    float ytos_new = ytos_inf - (ytos_inf - ytos[idx]) * expf(-dt / tys);
+    float rtos_new = rs_inf - (rs_inf - rtos[idx]) * expf(-dt / trs);
 
+    // Fast component (Ito,f)
+    float xtof_inf = xtos_inf;
+    float ytof_inf = ytos_inf;
+    float txf = 3.5f * expf(-powf(_v / 30.0f, 2.0f)) + 1.5f;
+    float tyf = 20.0f / (1.0f + expf(rt2)) + 20.0f;
 
-@cp.fuse()
-def _fused_comp_ik1(v, FRT, XKO, XKI, GK1):
-    """融合后的IK1计算内核 (无状态更新)"""
-    ek = (1.0 / FRT) * cp.log(XKO / XKI)
+    float xtof_new = xtof_inf - (xtof_inf - xtof[idx]) * expf(-dt / txf);
+    float ytof_new = ytof_inf - (ytof_inf - ytof[idx]) * expf(-dt / tyf);
 
-    aki = 1.02 / (1.0 + cp.exp(0.2385 * (v - ek - 59.215)))
-    bki = (0.49124 * cp.exp(0.08032 * (v - ek + 5.476)) +
-           cp.exp(0.06175 * (v - ek - 594.31))) / (1.0 + cp.exp(-0.5143 * (v - ek + 4.753)))
+    float itos = GTOS * xtos_new * (0.5f * ytos_new + 0.5f * rtos_new) * (_v - ek);
+    float itof = GTOF * xtof_new * ytof_new * (_v - ek);
+    float ito = itos + itof;
 
-    xkin = aki / (aki + bki)
-    gki = cp.sqrt(XKO / 5.4)
-    return GK1 * gki * xkin * (v - ek)
+    // =================================================================
+    // 7. Total Current & Voltage Update
+    // =================================================================
+    float jncx = Jncx_ptr[0]; 
+    float ilcc = Ilcc_ptr[0];
+    float incx = WCA * jncx;
+    float ilcc_curr = 2.0f * WCA * (-ilcc);
 
+    float itotal = ina + ikr + iks + ik1 + inak + incx + ilcc_curr + ito;
 
-@cp.fuse()
-def _fused_comp_ito(v, xtof, ytof, xtos, ytos, rtos, dt, FRT, XKO, XKI, GTOS, GTOF):
-    """融合后的Ito计算内核"""
-    ek = (1.0 / FRT) * cp.log(XKO / XKI)
+    // Euler update for voltage
+    v[idx] = _v + dt * (-itotal + istim);
 
-    rt1 = -(v + 3.0) / 15.0
-    rt2 = (v + 33.5) / 10.0
-    rt3 = (v + 60.0) / 10.0
+    // =================================================================
+    // 8. Write back states
+    // =================================================================
+    xm[idx] = xm_new; xh[idx] = xh_new; xj[idx] = xj_new;
+    xr[idx] = xr_new; xs1[idx] = xs1_new; xs2[idx] = xs2_new;
+    xtof[idx] = xtof_new; ytof[idx] = ytof_new;
+    xtos[idx] = xtos_new; ytos[idx] = ytos_new; rtos[idx] = rtos_new;
+}
+'''
 
-    xtos_inf = 1.0 / (1.0 + cp.exp(rt1))
-    ytos_inf = 1.0 / (1.0 + cp.exp(rt2))
-    rs_inf = 1.0 / (1.0 + cp.exp(rt2))
+# 编译内核
+ucla_kernel = cp.RawKernel(ucla_kernel_source, 'update_ucla_cell_kernel')
 
-    trs = (2800.0 - 500.0) / (1.0 + cp.exp(rt3)) + 220.0 + 500.0
-    txs = 9.0 / (1.0 + cp.exp(-rt1)) + 0.5
-    tys = 3000.0 / (1.0 + cp.exp(rt3)) + 30.0
-
-    xtos_new = xtos_inf - (xtos_inf - xtos) * cp.exp(-dt / txs)
-    ytos_new = ytos_inf - (ytos_inf - ytos) * cp.exp(-dt / tys)
-    rtos_new = rs_inf - (rs_inf - rtos) * cp.exp(-dt / trs)
-
-    # Fast component
-    xtof_inf = xtos_inf
-    ytof_inf = ytos_inf
-    txf = 3.5 * cp.exp(-(v / 30.0) ** 2) + 1.5
-    tyf = 20.0 / (1.0 + cp.exp(rt2)) + 20.0
-
-    xtof_new = xtof_inf - (xtof_inf - xtof) * cp.exp(-dt / txf)
-    ytof_new = ytof_inf - (ytof_inf - ytof) * cp.exp(-dt / tyf)
-
-    itos = GTOS * xtos_new * (0.5 * ytos_new + 0.5 * rtos_new) * (v - ek)
-    itof = GTOF * xtof_new * ytof_new * (v - ek)
-
-    return itos + itof, xtof_new, ytof_new, xtos_new, ytos_new, rtos_new
-
-
-@cp.fuse()
-def _fused_comp_inak(v, xnai, FRT, XNAO, XKO, GNAK):
-    """融合后的INaK计算内核"""
-    sigma = (cp.exp(XNAO / 67.3) - 1.0) / 7.0
-    fnak = 1.0 / (1.0 + 0.1245 * cp.exp(-0.1 * v * FRT) +
-                  0.0365 * sigma * cp.exp(-v * FRT))
-
-    xkmnai = 12.0
-    xkmko = 1.5
-
-    return GNAK * fnak * (1.0 / (1.0 + (xkmnai / xnai))) * (XKO / (XKO + xkmko))
-
-
-@cp.fuse()
-def _fused_update_voltage_step(v, ina, ik1, ito, ikr, iks, inak, jncx, ilcc, istim,
-                               dt, WCA):
-    """融合后的总电流及电压更新内核"""
-    # 转换通量为电流
-    incx = WCA * jncx
-    ilcc_curr = 2.0 * WCA * (-ilcc)
-
-    total_current = ina + ik1 + ito + ikr + iks + inak + incx + ilcc_curr
-    dvdt = -total_current + istim
-
-    v_new = v + dvdt * dt
-    return v_new
-
-
-# =============================================================================
-# Main Class
-# =============================================================================
 
 class GPUUCLACell:
     """UCLA心肌细胞模型类（GPU版本 - Kernel Fusion Optimized）"""
@@ -254,55 +251,26 @@ class GPUUCLACell:
 
         self.shift_h = cp.zeros(n_cells, dtype=cp.float32)
 
-        # 预热：首次调用fuse函数可能会慢，但之后会很快
-        pass
-
-    def step(self, dt, istim, dv_limit=-1):
+    def step(self, dt, istim):
         """
         执行一个时间步的更新
         """
-        # 1. 计算各离子电流并更新相应的门控变量
-        # 使用融合内核大幅减少启动开销和显存访问
+        # --- 关键修正：确保标量是 Python float 类型，避免 CuPy Implicit conversion 错误 ---
+        val_istim = float(istim) if not isinstance(istim, cp.ndarray) else float(istim.item())
+        val_dt = float(dt) if not isinstance(dt, cp.ndarray) else float(dt.item())
 
-        # INa
-        ina, self.xh, self.xj, self.xm = _fused_comp_ina(
-            self.v, self.xh, self.xj, self.xm, self.xnai, self.shift_h,
-            dt, self.FRT, self.XNAO, self.GNA
-        )
-
-        # IKr
-        ikr, self.xr = _fused_comp_ikr(
-            self.v, self.xr, dt, self.FRT, self.XKO, self.XKI, self.GKR
-        )
-
-        # IKs
-        iks, self.xs1, self.xs2 = _fused_comp_iks(
-            self.v, self.xs1, self.xs2, self.ci, self.xnai,
-            dt, self.FRT, self.XKO, self.XNAO, self.XKI, self.GKS
-        )
-
-        # IK1 (无状态变量更新)
-        ik1 = _fused_comp_ik1(self.v, self.FRT, self.XKO, self.XKI, self.GK1)
-
-        # Ito
-        ito, self.xtof, self.ytof, self.xtos, self.ytos, self.rtos = _fused_comp_ito(
-            self.v, self.xtof, self.ytof, self.xtos, self.ytos, self.rtos,
-            dt, self.FRT, self.XKO, self.XKI, self.GTOS, self.GTOF
-        )
-
-        # INaK
-        inak = _fused_comp_inak(self.v, self.xnai, self.FRT, self.XNAO, self.XKO, self.GNAK)
-
-        # 2. 更新电压 (融合了电流求和与欧拉步)
-        # 注意: 为了极致速度，这里移除了 dv_limit 的检查 (如有必要可另加)
-        self.v = _fused_update_voltage_step(
-            self.v, ina, ik1, ito, ikr, iks, inak, self.JNCX, self.ILCC, istim,
-            dt, self.WCA
-        )
-
-        # 更新钠浓度 (注释掉的逻辑保持原样)
-        # dxnai = -1.0 * (ina + 3.0 * inak + 3.0 * incx) / (self.WCA * 1000.0)
-        # self.xnai += dxnai * dt
+        # 调用单一融合内核
+        ucla_kernel((1,), (1,), (
+            self.v, self.xm, self.xh, self.xj,
+            self.xr, self.xs1, self.xs2,
+            self.xtof, self.ytof, self.xtos, self.ytos, self.rtos,
+            self.xnai, self.ci,
+            self.JNCX, self.ILCC,
+            cp.float32(val_istim), cp.float32(val_dt),
+            cp.float32(self.FRT), cp.float32(self.XNAO), cp.float32(self.XKI), cp.float32(self.XKO),
+            cp.float32(self.GNA), cp.float32(self.GKR), cp.float32(self.GKS), cp.float32(self.GK1),
+            cp.float32(self.GNAK), cp.float32(self.GTOS), cp.float32(self.GTOF), cp.float32(self.WCA)
+        ))
 
         return True
 
@@ -324,8 +292,7 @@ class GPUUCLACell:
             'ytos': cp.asnumpy(self.ytos),
             'rtos': cp.asnumpy(self.rtos),
             'JNCX': cp.asnumpy(self.JNCX),
-            'ILCC': cp.asnumpy(self.ILCC),
-            'shift_h': cp.asnumpy(self.shift_h)
+            'ILCC': cp.asnumpy(self.ILCC)
         }
 
     def from_numpy(self, data):
