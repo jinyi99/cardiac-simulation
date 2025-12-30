@@ -93,7 +93,7 @@ extern "C" __global__ void diffusion_kernel_3d(
     // 1D 线性索引映射到 3D 坐标
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     int total_voxels = nx * ny * nz;
-    
+
     if (idx >= total_voxels) return;
 
     // 计算 x, y, z 坐标 (假设数据存储格式为 Z-Y-X 或类似连续存储)
@@ -111,7 +111,7 @@ extern "C" __global__ void diffusion_kernel_3d(
     float c_left  = (x > 0)      ? c_in[idx - 1]  : c_center;
     // 右邻居 (x+1)
     float c_right = (x < nx - 1) ? c_in[idx + 1]  : c_center;
-    
+
     // 上邻居 (y-1) - 注意 strides
     float c_up    = (y > 0)      ? c_in[idx - nx] : c_center;
     // 下邻居 (y+1)
@@ -128,7 +128,7 @@ extern "C" __global__ void diffusion_kernel_3d(
     // 更新公式: c_new = c + (D * dt / dx^2) * Laplacian / beta
     // 预计算 factor = D * dt / (dx * dx)
     float factor = D * dt / (dx * dx);
-    
+
     // 获取缓冲系数 (注意：如果 beta 需要重新计算，可以在这里算，但通常传入预计算好的)
     float b = beta[idx];
 
