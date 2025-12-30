@@ -2,7 +2,7 @@ import cupy as cp
 import numpy as np
 
 # =============================================================================
-# CUDA Kernels for Stochastic Gating
+# CUDA Kernels for Stochastic Gating & Flux Calculation
 # =============================================================================
 
 # 随机数生成器辅助函数 (XORWOW)
@@ -17,41 +17,38 @@ __device__ float next_rand(unsigned int* state) {
 }
 '''
 
-# RyR 更新内核
+# --- 1. RyR Update Kernel (Stochastic) ---
 ryr_kernel_source = rng_device_func + r'''
 extern "C" __global__ void update_ryr_kernel(
     int* Nr, int* Nrc, int* Nri, int* Nrr,
     float* rfire,
-    const float* alpha, const float* beta, const float* gamma, const float* delta,
-    const float KBMR2C,
+    const float* cd, const float* cj,
+    const float KAP, const float KAM, const float KBP, const float KBM, const float KBMR2C,
     const float dt, const int n_cru, const unsigned int seed_base
 ) {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= n_cru) return;
 
-    // 初始化随机数状态
     unsigned int rng_state = seed_base + idx;
-    // 预热 RNG
     next_rand(&rng_state);
 
-    // 加载状态
+    // Load State
     int nr = Nr[idx];
     int nrc = Nrc[idx];
     int nri = Nri[idx];
     int nrr = Nrr[idx];
     float current_rfire = rfire[idx];
+    float _cd = cd[idx];
 
-    // 加载速率常数
-    float a = alpha[idx];
-    float b = beta[idx];
-    float g = gamma[idx];
-    float d = delta[idx];
+    // Compute Rates locally (Vectorized inside kernel)
+    float a = KAP * _cd * _cd;
+    float b = KAM;
+    float g = KBP * _cd;
+    float d = KBM;
     float k_src = KBMR2C;
 
     float t_elapsed = 0.0f;
-
     while (t_elapsed < dt) {
-        // 计算各转换速率 (Propensities)
         float sco = nrc * a;
         float soc = nr * b;
         float scr = nrc * g;
@@ -61,60 +58,56 @@ extern "C" __global__ void update_ryr_kernel(
         float sio = nri * d;
         float soi = nr * g;
 
-        // 计算累积速率
-        float lam1 = sco + soc;
-        float lam2 = lam1 + scr;
-        float lam3 = lam2 + src;
-        float lam4 = lam3 + sri;
-        float lam5 = lam4 + sir;
-        float lam6 = lam5 + sio;
-        float lamtot = lam6 + soi;
+        float lamtot = sco + soc + scr + src + sri + sir + sio + soi;
 
         if (lamtot <= 1e-6f) {
-            t_elapsed = dt; // 无事件发生
+            t_elapsed = dt;
             break;
         }
 
-        // 检查是否发生事件
         float dt_step = dt - t_elapsed;
         if (current_rfire > lamtot * dt_step) {
-            // 本步内无更多事件
             current_rfire -= lamtot * dt_step;
             t_elapsed = dt;
         } else {
-            // 发生事件
-            // 更新时间
             t_elapsed += current_rfire / lamtot;
-            
-            // 确定哪个反应发生
             float r2 = lamtot * next_rand(&rng_state);
 
-            if (r2 <= sco) {
-                nrc--; nr++;
-            } else if (r2 <= lam1) {
-                nrc++; nr--;
-            } else if (r2 <= lam2) {
-                nrc--; nrr++;
-            } else if (r2 <= lam3) {
-                nrr--; nrc++;
-            } else if (r2 <= lam4) {
-                nrr--; nri++;
-            } else if (r2 <= lam5) {
-                nri--; nrr++;
-            } else if (r2 <= lam6) {
-                nri--; nr++;
-            } else {
-                nr--; nri++;
+            // Branching logic for state transitions
+            float acc = sco;
+            if (r2 <= acc) { nrc--; nr++; }
+            else {
+                acc += soc;
+                if (r2 <= acc) { nrc++; nr--; }
+                else {
+                    acc += scr;
+                    if (r2 <= acc) { nrc--; nrr++; }
+                    else {
+                        acc += src;
+                        if (r2 <= acc) { nrr--; nrc++; }
+                        else {
+                            acc += sri;
+                            if (r2 <= acc) { nrr--; nri++; }
+                            else {
+                                acc += sir;
+                                if (r2 <= acc) { nri--; nrr++; }
+                                else {
+                                    acc += sio;
+                                    if (r2 <= acc) { nri--; nr++; }
+                                    else { nr--; nri++; }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
-            // 重置 rfire (指数分布: -log(u))
             float u = next_rand(&rng_state);
             while(u <= 0.0f || u >= 1.0f) u = next_rand(&rng_state);
             current_rfire = -logf(u);
         }
     }
 
-    // 写回状态
     Nr[idx] = nr;
     Nrc[idx] = nrc;
     Nri[idx] = nri;
@@ -123,16 +116,12 @@ extern "C" __global__ void update_ryr_kernel(
 }
 '''
 
-# LCC 更新内核
+# --- 2. LCC Update Kernel (Stochastic) ---
 lcc_kernel_source = rng_device_func + r'''
 extern "C" __global__ void update_lcc_kernel(
     int* Nli2, int* Nli, int* Nlc2, int* Nlc, int* Nl, int* Nlb2, int* Nlb1,
     float* lfire,
-    const float* k1, const float* k2, const float* k3, const float* k4,
-    const float* k5, const float* k6, const float* k1p, const float* k2p,
-    const float* k3p, const float* k4p, const float* k5p, const float* k6p,
-    const float* s1, const float* s2, const float* alphalcc, const float* betalcc,
-    const float RR1, const float RR2, const float S1P, const float S2P,
+    const float* cd, const float v_val,
     const float dt, const int n_cru, const unsigned int seed_base
 ) {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
@@ -141,78 +130,58 @@ extern "C" __global__ void update_lcc_kernel(
     unsigned int rng_state = seed_base + idx;
     next_rand(&rng_state);
 
-    // 加载状态 (Nli2:1, Nli:2, Nlc2:3, Nlc:4, Nl:5, Nlb2:6, Nlb1:7)
-    int n1 = Nli2[idx];
-    int n2 = Nli[idx];
-    int n3 = Nlc2[idx];
-    int n4 = Nlc[idx];
-    int n5 = Nl[idx];
-    int n6 = Nlb2[idx];
-    int n7 = Nlb1[idx];
-    
+    // Load State
+    int n1 = Nli2[idx]; int n2 = Nli[idx]; int n3 = Nlc2[idx]; int n4 = Nlc[idx];
+    int n5 = Nl[idx]; int n6 = Nlb2[idx]; int n7 = Nlb1[idx];
     float current_lfire = lfire[idx];
+    float _cd = cd[idx];
 
-    // 加载参数
-    float _k1 = k1[idx]; float _k2 = k2[idx]; float _k3 = k3[idx]; float _k4 = k4[idx];
-    float _k5 = k5[idx]; float _k6 = k6[idx]; 
-    float _k1p = k1p[idx]; float _k2p = k2p[idx]; float _k3p = k3p[idx]; float _k4p = k4p[idx];
-    float _k5p = k5p[idx]; float _k6p = k6p[idx];
-    float _s1 = s1[idx]; float _s2 = s2[idx];
-    float _alpha = alphalcc[idx]; float _beta = betalcc[idx];
-    
+    // --- Compute Parameters Locally (Avoid global memory reads for arrays) ---
+    const float CDBAR = 0.5f;
+    const float K2 = 0.0001f;
+    const float TBA = 450.0f;
+    const float K1P = 0.00413f;
+    const float RR1 = 0.3f;
+    const float RR2 = 3.0f;
+    const float K2P = 0.00224f;
+    const float S1P = 0.00195f;
+    const float S2P = 0.00195f * (0.00224f / 0.00413f) * (0.3f / 3.0f);
+
+    float expmv_8 = expf(-v_val / 8.0f);
+    float alphalcc = 1.0f / (1.0f + expmv_8);
+    float betalcc = expmv_8 / (1.0f + expmv_8);
+
+    float fc = 1.0f / (1.0f + powf(CDBAR / _cd, 3.0f));
+    float k1 = 0.03f * fc;
+    float k3 = expf(-(v_val + 40.0f) / 3.0f) / (3.0f * (1.0f + expf(-(v_val + 40.0f) / 3.0f)));
+
+    float Rv = 10.0f + 4954.0f * expf(v_val / 15.6f);
+    float TCa = (78.0329f + 0.1f * powf(1.0f + _cd / 0.5f, 4.0f)) / (1.0f + powf(_cd / 0.5f, 4.0f));
+
+    float Ps = 1.0f / (1.0f + expf(-(v_val + 40.0f) / 11.32f));
+    float Pr = 1.0f / (1.0f + expf(-(v_val + 40.0f) / 4.0f));
+
+    float tauCa = (Rv - TCa) * Pr + TCa;
+    float tauBa = (Rv - TBA) * Pr + TBA;
+
+    float k5 = (1.0f - Ps) / tauCa;
+    float k6 = fc * Ps / tauCa;
+    float k5p = (1.0f - Ps) / tauBa;
+    float k6p = Ps / tauBa;
+
+    float k4 = k3 * (k1 / K2) * (k5 / k6) / expmv_8;
+    float k4p = k3 * (K1P / K2P) * (k5p / k6p) / expmv_8; // k3p = k3
+
+    float s1 = 0.02f * fc;
+    float s2 = s1 * (K2 / k1) * (RR1 / RR2);
+
     float t_elapsed = 0.0f;
-
     while (t_elapsed < dt) {
-        // 计算转换速率
-        float s12 = n1 * _k4;
-        float s13 = n1 * _k5;
-        float s21 = n2 * _k3;
-        float s24 = n2 * _k2;
-        float s25 = n2 * _s2;
-        float s31 = n3 * _k6;
-        float s36 = n3 * _k6p;
-        float s34 = n3 * _alpha;
-        float s43 = n4 * _beta;
-        float s42 = n4 * _k1;
-        float s45 = n4 * RR1;
-        float s47 = n4 * _k1p;
-        float s52 = n5 * _s1;
-        float s54 = n5 * RR2;
-        float s57 = n5 * S1P;
-        float s63 = n6 * _k5p;
-        float s67 = n6 * _k4p;
-        float s74 = n7 * _k2p;
-        float s75 = n7 * S2P;
-        float s76 = n7 * _k3p;
+        float lamtot = n1*(k4 + k5) + n2*(k3 + K2 + s2) + n3*(k6 + k6p + alphalcc) +
+                       n4*(betalcc + k1 + RR1 + K1P) + n5*(s1 + RR2 + S1P) +
+                       n6*(k5p + k4p) + n7*(K2P + S2P + k3);
 
-        // 累积速率
-        float rate_sum = s12;
-        float r_s13 = rate_sum + s13; rate_sum = r_s13;
-        float r_s21 = rate_sum + s21; rate_sum = r_s21;
-        float r_s24 = rate_sum + s24; rate_sum = r_s24;
-        float r_s25 = rate_sum + s25; rate_sum = r_s25;
-        float r_s31 = rate_sum + s31; rate_sum = r_s31;
-        float r_s36 = rate_sum + s36; rate_sum = r_s36;
-        float r_s34 = rate_sum + s34; rate_sum = r_s34;
-        float r_s43 = rate_sum + s43; rate_sum = r_s43;
-        float r_s42 = rate_sum + s42; rate_sum = r_s42;
-        float r_s45 = rate_sum + s45; rate_sum = r_s45;
-        float r_s47 = rate_sum + s47; rate_sum = r_s47;
-        float r_s52 = rate_sum + s52; rate_sum = r_s52;
-        float r_s54 = rate_sum + s54; rate_sum = r_s54;
-        float r_s57 = rate_sum + s57; rate_sum = r_s57;
-        float r_s63 = rate_sum + s63; rate_sum = r_s63;
-        float r_s67 = rate_sum + s67; rate_sum = r_s67;
-        float r_s74 = rate_sum + s74; rate_sum = r_s74;
-        float r_s75 = rate_sum + s75; rate_sum = r_s75;
-        float r_s76 = rate_sum + s76; rate_sum = r_s76;
-
-        float lamtot = rate_sum;
-
-        if (lamtot <= 1e-6f) {
-            t_elapsed = dt;
-            break;
-        }
+        if (lamtot <= 1e-6f) { t_elapsed = dt; break; }
 
         float dt_step = dt - t_elapsed;
         if (current_lfire > lamtot * dt_step) {
@@ -222,27 +191,27 @@ extern "C" __global__ void update_lcc_kernel(
             t_elapsed += current_lfire / lamtot;
             float r2 = lamtot * next_rand(&rng_state);
 
-            // 状态更新逻辑 (20个分支)
-            if (r2 <= s12) { n1--; n2++; }
-            else if (r2 <= r_s13) { n1--; n3++; }
-            else if (r2 <= r_s21) { n2--; n1++; }
-            else if (r2 <= r_s24) { n2--; n4++; }
-            else if (r2 <= r_s25) { n2--; n5++; }
-            else if (r2 <= r_s31) { n3--; n1++; }
-            else if (r2 <= r_s36) { n3--; n6++; }
-            else if (r2 <= r_s34) { n3--; n4++; }
-            else if (r2 <= r_s43) { n4--; n3++; }
-            else if (r2 <= r_s42) { n4--; n2++; }
-            else if (r2 <= r_s45) { n4--; n5++; }
-            else if (r2 <= r_s47) { n4--; n7++; }
-            else if (r2 <= r_s52) { n5--; n2++; }
-            else if (r2 <= r_s54) { n5--; n4++; }
-            else if (r2 <= r_s57) { n5--; n7++; }
-            else if (r2 <= r_s63) { n6--; n3++; }
-            else if (r2 <= r_s67) { n6--; n7++; }
-            else if (r2 <= r_s74) { n7--; n4++; }
-            else if (r2 <= r_s75) { n7--; n5++; }
-            else { n7--; n6++; }
+            // Simplified selection logic (mimics original 20-case branch)
+            float acc = n1*k4; if(r2<=acc){n1--;n2++;}
+            else{acc+=n1*k5; if(r2<=acc){n1--;n3++;}
+            else{acc+=n2*k3; if(r2<=acc){n2--;n1++;}
+            else{acc+=n2*K2; if(r2<=acc){n2--;n4++;}
+            else{acc+=n2*s2; if(r2<=acc){n2--;n5++;}
+            else{acc+=n3*k6; if(r2<=acc){n3--;n1++;}
+            else{acc+=n3*k6p;if(r2<=acc){n3--;n6++;}
+            else{acc+=n3*alphalcc;if(r2<=acc){n3--;n4++;}
+            else{acc+=n4*betalcc;if(r2<=acc){n4--;n3++;}
+            else{acc+=n4*k1; if(r2<=acc){n4--;n2++;}
+            else{acc+=n4*RR1;if(r2<=acc){n4--;n5++;}
+            else{acc+=n4*K1P;if(r2<=acc){n4--;n7++;}
+            else{acc+=n5*s1; if(r2<=acc){n5--;n2++;}
+            else{acc+=n5*RR2;if(r2<=acc){n5--;n4++;}
+            else{acc+=n5*S1P;if(r2<=acc){n5--;n7++;}
+            else{acc+=n6*k5p;if(r2<=acc){n6--;n3++;}
+            else{acc+=n6*k4p;if(r2<=acc){n6--;n7++;}
+            else{acc+=n7*K2P;if(r2<=acc){n7--;n4++;}
+            else{acc+=n7*S2P;if(r2<=acc){n7--;n5++;}
+            else{n7--;n6++;}}}}}}}}}}}}}}}}}}}
 
             float u = next_rand(&rng_state);
             while(u <= 0.0f || u >= 1.0f) u = next_rand(&rng_state);
@@ -256,84 +225,101 @@ extern "C" __global__ void update_lcc_kernel(
 }
 '''
 
+# --- 3. Flux Calculation Kernel (Vectorized & Indexed) ---
+flux_kernel_source = r'''
+extern "C" __global__ void cru_flux_kernel(
+    float* cd, float* cj, float* Ilcc_out,
+    float* cm, float* cs, 
+    const int* networkIdx, 
+    const int* Nr, const int* Nl,
+    const float v_val, const float dt, 
+    const bool fix_sr, const int n_cru
+) {
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= n_cru) return;
+
+    // 1. 读取索引和本地状态
+    int map_idx = networkIdx[idx]; 
+    float _cd = cd[idx];
+    float _cj = cj[idx];
+    int _nr = Nr[idx];
+    int _nl = Nl[idx];
+
+    // 2. 读取 Myo/SR 浓度
+    float _cm_myo = cm[map_idx];
+    float _cs_myo = cs[map_idx];
+
+    // 3. 计算电流 (RyR & LCC)
+    float Iryr = _nr * 0.000205f * (_cj - _cd);
+
+    float phi = v_val * (96485.0f / (8314.0f * 310.0f));
+    if (abs(phi) < 1e-5f) phi = 1e-5f;
+    float denom = expf(2.0f * phi) - 1.0f;
+    float Ilcc = _nl * 0.000913f * 2.0f * phi * (0.341f * 1800.0f - expf(2.0f * phi) * _cd) / denom;
+
+    Ilcc_out[idx] = Ilcc; 
+
+    // 4. 计算通量
+    float Vj = 0.1f;
+    float Vd = 0.00126f;
+    float gjsr = 1.0f;
+    float gds = 0.303f / 0.00126f;
+
+    // Buffering factors
+    float beta_m = 1.0f + 15.0f * 13.0f / ((_cm_myo + 13.0f) * (_cm_myo + 13.0f)) +
+                          7.0f * 0.3f / ((_cm_myo + 0.3f) * (_cm_myo + 0.3f));
+    float beta_sr = 1.0f + 140.0f * 650.0f / ((_cs_myo + 650.0f) * (_cs_myo + 650.0f));
+    float beta_j = 1.0f + 140.0f * 650.0f / ((_cj + 650.0f) * (_cj + 650.0f));
+
+    float FluxJ = (gjsr * (_cs_myo - _cj) - Iryr / Vj) / beta_j;
+    float FluxS = (-gjsr * (_cs_myo - _cj) * (Vj / 0.2f)) / beta_sr;
+    float FluxM = (gds * (_cd - _cm_myo) * (Vd / 5.0f)) / beta_m;
+
+    // 5. 更新状态
+    if (!fix_sr) {
+        cj[idx] = _cj + dt * FluxJ;
+        atomicAdd(&cs[map_idx], dt * FluxS); 
+    }
+
+    cd[idx] = _cd - dt * FluxM; 
+    atomicAdd(&cm[map_idx], dt * FluxM);
+}
+'''
+
 # 编译内核
 ryr_kernel = cp.RawKernel(ryr_kernel_source, 'update_ryr_kernel')
 lcc_kernel = cp.RawKernel(lcc_kernel_source, 'update_lcc_kernel')
+flux_kernel = cp.RawKernel(flux_kernel_source, 'cru_flux_kernel')
 
 
 class GPUNivalaRyR:
-    """RyR受体类（Nivala模型） - Optimized with RawKernel"""
-
-    # RyR参数
-    KAP = 0.7 * 0.005
-    KAM = 1.0
-    KBM = 0.003
-    KBMR2C = 1.0 * 0.003
-    KBP = 0.00075
+    # 参数定义
+    KAP, KAM, KBM, KBMR2C, KBP = 0.7 * 0.005, 1.0, 0.003, 1.0 * 0.003, 0.00075
 
     def __init__(self, n_cru, n_ryr=100):
         self.n_cru = n_cru
-        self.n_ryr = n_ryr
-
-        # Markov状态 (使用int32以配合atomic操作潜力，虽然这里单线程处理)
         self.Nr = cp.zeros(n_cru, dtype=cp.int32)
         self.Nrc = cp.full(n_cru, int(0.75 * n_ryr), dtype=cp.int32)
         self.Nri = cp.zeros(n_cru, dtype=cp.int32)
         self.Nrr = n_ryr - self.Nr - self.Nrc - self.Nri
-
         self.rng = cp.random.RandomState(seed=42)
-        # 初始随机发射时间
         self.rfire = -cp.log(self.rng.uniform(0, 1, n_cru)).astype(cp.float32)
 
     def update_ryr(self, dt, cd, cj):
-        """使用CUDA Kernel并行更新RyR状态"""
-        # 1. 预计算依赖于浓度的速率常数 (向量化计算，极快)
-        alpha = (self.KAP * cp.power(cd, 2)).astype(cp.float32)
-        gamma = (self.KBP * cd).astype(cp.float32)
-        beta = cp.full(self.n_cru, self.KAM, dtype=cp.float32)
-        delta = cp.full(self.n_cru, self.KBM, dtype=cp.float32)
-
-        # 2. 调用 CUDA Kernel
-        threads_per_block = 256
-        blocks_per_grid = (self.n_cru + threads_per_block - 1) // threads_per_block
-        
-        # 生成一个随机种子基数，确保每步随机性不同
-        seed_base = int(cp.random.randint(0, 2**31 - 1))
-
-        ryr_kernel(
-            (blocks_per_grid,), (threads_per_block,),
-            (
-                self.Nr, self.Nrc, self.Nri, self.Nrr,
-                self.rfire,
-                alpha, beta, gamma, delta,
-                cp.float32(self.KBMR2C),
-                cp.float32(dt), cp.int32(self.n_cru), cp.uint32(seed_base)
-            )
-        )
-
-    def get_ryr_current(self, cd, cj):
-        return self.Nr * 0.000205 * (cj - cd)
+        grid = (self.n_cru + 255) // 256
+        seed = int(cp.random.randint(0, 2 ** 31 - 1))
+        ryr_kernel((grid,), (256,), (
+            self.Nr, self.Nrc, self.Nri, self.Nrr, self.rfire,
+            cd, cj,
+            cp.float32(self.KAP), cp.float32(self.KAM), cp.float32(self.KBP),
+            cp.float32(self.KBM), cp.float32(self.KBMR2C),
+            cp.float32(dt), cp.int32(self.n_cru), cp.uint32(seed)
+        ))
 
 
 class GPULCC:
-    """L型钙通道类 - Optimized with RawKernel"""
-
-    # LCC参数
-    CDBAR = 0.5
-    K2 = 0.0001
-    TBA = 450.0
-    K1P = 0.00413
-    RR1 = 0.3
-    RR2 = 3.0
-    K2P = 0.00224
-    S1P = 0.00195
-    S2P = S1P * (K2P / K1P) * (RR1 / RR2)
-
     def __init__(self, n_cru, n_lcc=10):
         self.n_cru = n_cru
-        self.n_lcc = n_lcc
-
-        # Markov状态 (Nli2:1, Nli:2, Nlc2:3, Nlc:4, Nl:5, Nlb2:6, Nlb1:7)
         self.Nl = cp.zeros(n_cru, dtype=cp.int32)
         self.Nlc = cp.zeros(n_cru, dtype=cp.int32)
         self.Nlc2 = cp.full(n_cru, n_lcc, dtype=cp.int32)
@@ -341,88 +327,21 @@ class GPULCC:
         self.Nli2 = cp.zeros(n_cru, dtype=cp.int32)
         self.Nlb1 = cp.zeros(n_cru, dtype=cp.int32)
         self.Nlb2 = cp.zeros(n_cru, dtype=cp.int32)
-
         self.rng = cp.random.RandomState(seed=43)
         self.lfire = -cp.log(self.rng.uniform(0, 1, n_cru)).astype(cp.float32)
 
-    def update_lcc(self, dt, cd, v):
-        """使用CUDA Kernel并行更新LCC状态"""
-        # 确保输入是float32
-        v = v.astype(cp.float32)
-        cd = cd.astype(cp.float32)
-
-        # 1. 预计算速率常数 (向量化)
-        expmv_8 = cp.exp(-v / 8.0)
-        alphalcc = 1.0 / (1.0 + expmv_8)
-        betalcc = expmv_8 / (1.0 + expmv_8)
-
-        fc = 1.0 / (1.0 + cp.power(self.CDBAR / cd, 3))
-        k1 = 0.03 * fc
-        k3 = cp.exp(-(v + 40.0) / 3.0) / (3.0 * (1.0 + cp.exp(-(v + 40.0) / 3.0)))
-
-        Rv = 10.0 + 4954.0 * cp.exp(v / 15.6)
-        TCa = (78.0329 + 0.1 * cp.power(1.0 + cd / 0.5, 4)) / (1.0 + cp.power(cd / 0.5, 4))
-
-        Ps = 1.0 / (1.0 + cp.exp(-(v + 40.0) / 11.32))
-        Pr = 1.0 / (1.0 + cp.exp(-(v + 40.0) / 4))
-
-        tauCa = (Rv - TCa) * Pr + TCa
-        tauBa = (Rv - self.TBA) * Pr + self.TBA
-
-        k5 = (1 - Ps) / tauCa
-        k6 = fc * Ps / tauCa
-        k5p = (1 - Ps) / tauBa
-        k6p = Ps / tauBa
-        k3p = k3
-        k4 = k3 * (k1 / self.K2) * (k5 / k6) / expmv_8
-        k4p = k3p * (self.K1P / self.K2P) * (k5p / k6p) / expmv_8
-
-        s1 = 0.02 * fc
-        s2 = s1 * (self.K2 / k1) * (self.RR1 / self.RR2)
-
-        # 准备常量数组
-        k2_arr = cp.full(self.n_cru, self.K2, dtype=cp.float32)
-        k1p_arr = cp.full(self.n_cru, self.K1P, dtype=cp.float32)
-        k2p_arr = cp.full(self.n_cru, self.K2P, dtype=cp.float32)
-
-        # 2. 调用 CUDA Kernel
-        threads_per_block = 256
-        blocks_per_grid = (self.n_cru + threads_per_block - 1) // threads_per_block
-        seed_base = int(cp.random.randint(0, 2**31 - 1))
-
-        lcc_kernel(
-            (blocks_per_grid,), (threads_per_block,),
-            (
-                self.Nli2, self.Nli, self.Nlc2, self.Nlc, self.Nl, self.Nlb2, self.Nlb1,
-                self.lfire,
-                k1.astype(cp.float32), k2_arr, k3.astype(cp.float32), k4.astype(cp.float32),
-                k5.astype(cp.float32), k6.astype(cp.float32),
-                k1p_arr, k2p_arr, k3p.astype(cp.float32), k4p.astype(cp.float32),
-                k5p.astype(cp.float32), k6p.astype(cp.float32),
-                s1.astype(cp.float32), s2.astype(cp.float32),
-                alphalcc.astype(cp.float32), betalcc.astype(cp.float32),
-                cp.float32(self.RR1), cp.float32(self.RR2), 
-                cp.float32(self.S1P), cp.float32(self.S2P),
-                cp.float32(dt), cp.int32(self.n_cru), cp.uint32(seed_base)
-            )
-        )
-
-    def get_lcc_current(self, cd, v):
-        phi = v * (96485.0 / (8314.0 * 310.0))
-        pca = 0.000913
-        
-        # 避免除零
-        phi = cp.where(cp.abs(phi) < 1e-5, 1e-5, phi)
-        
-        denom = cp.exp(2.0 * phi) - 1.0
-        # 如果 denom 太小，也处理一下，不过上面 phi 处理过应该还好
-        
-        I_ca = self.Nl * pca * 2.0 * phi * (0.341 * 1800.0 - cp.exp(2.0 * phi) * cd) / denom
-        return I_ca
+    def update_lcc(self, dt, cd, v_val):
+        grid = (self.n_cru + 255) // 256
+        seed = int(cp.random.randint(0, 2 ** 31 - 1))
+        lcc_kernel((grid,), (256,), (
+            self.Nli2, self.Nli, self.Nlc2, self.Nlc, self.Nl, self.Nlb2, self.Nlb1,
+            self.lfire, cd, cp.float32(v_val),
+            cp.float32(dt), cp.int32(self.n_cru), cp.uint32(seed)
+        ))
 
 
 class GPUCRU:
-    """钙释放单元类"""
+    """钙释放单元类 - Optimized with Flux Kernel"""
 
     def __init__(self, n_cru, n_ryr=100, n_lcc=10):
         self.n_cru = n_cru
@@ -440,88 +359,47 @@ class GPUCRU:
         x = (idx % nx) * nx_myo + nx_myo // 2
         y = (idx // nx % ny) * nx_myo + nx_myo // 2
         z = (idx // (nx * ny)) * nx_myo + nx_myo // 2
-        self.networkIdx = z * (nx * nx_myo) * (ny * nx_myo) + y * (nx * nx_myo) + x
+        self.networkIdx = (z * (nx * nx_myo) * (ny * nx_myo) + y * (nx * nx_myo) + x).astype(cp.int32)
 
     def update_flux(self, dt, cm, cs, v, xnai, fix_sr=False):
-        # 1. 广播与维度检查 (确保 v 是 shape=(n_cru,) 的向量)
-        if isinstance(v, (float, int)):
-            v = cp.full(self.n_cru, float(v), dtype=cp.float32)
-        else:
-            v = cp.asarray(v, dtype=cp.float32)
-            if v.ndim == 0 or v.size == 1:
-                v = cp.full(self.n_cru, float(v), dtype=cp.float32)
+        # 1. 健壮的电压值提取 (修复 IndexError)
+        # v 可能是标量、0维数组或1维数组
+        if isinstance(v, cp.ndarray):
+            if v.ndim == 0:
+                v_val = float(v)
+            elif v.size == 1:
+                v_val = float(v.flatten()[0])
             else:
-                v = v.reshape(-1) # 确保展平
+                v_val = float(v[0])  # 默认取第一个
+        else:
+            v_val = float(v)
 
-        # 2. 并行更新 LCC 和 RyR (现在这里调用的是 fast kernels)
-        self.LCCs.update_lcc(dt, self.cd, v)
+        # 2. 并行更新 LCC 和 RyR 状态
+        self.LCCs.update_lcc(dt, self.cd, v_val)
         self.RyRs.update_ryr(dt, self.cd, self.cj)
 
-        # 3. 计算缓冲 (Vectorized)
-        beta_m = (1.0 + 15.0 * 13.0 / ((cm[self.networkIdx] + 13.0) ** 2) +
-                  7.0 * 0.3 / ((cm[self.networkIdx] + 0.3) ** 2))
-        
-        beta_sr = (1.0 + 140.0 * 650.0 / ((cs[self.networkIdx] + 650.0) ** 2))
-        beta_j = (1.0 + 140.0 * 650.0 / ((self.cj + 650.0) ** 2))
-
-        # 4. 计算通量
-        Iryr = self.RyRs.get_ryr_current(self.cd, self.cj)
-        self.Ilcc = self.LCCs.get_lcc_current(self.cd, v)
-
-        Vj, Vd = 0.1, 0.00126
-        gjsr, gds = 1.0, 0.303 / 0.00126
-
-        cs_at_cru = cs[self.networkIdx]
-        cm_at_cru = cm[self.networkIdx]
-
-        FluxJ = (gjsr * (cs_at_cru - self.cj) - Iryr / Vj) / beta_j
-        FluxS = (-gjsr * (cs_at_cru - self.cj) * (Vj / 0.2)) / beta_sr
-        FluxM = (gds * (self.cd - cm_at_cru) * (Vd / 5.0)) / beta_m
-
-        # 5. 更新状态
-        if not fix_sr:
-            self.cj += dt * FluxJ
-            # 注意: 这里可能有race condition如果多个CRU对应同一个myo voxel
-            # 但在常规设置下 CRU 是一一对应的或稀疏的。
-            # 如果确实密集，应使用 cp.scatter_add (atomicAdd)
-            # 但这里为了性能先保持原样，通常 networkIdx 是唯一的。
-            cs[self.networkIdx] += dt * FluxS
-
-        cm[self.networkIdx] += dt * FluxM
-
-        # 6. 处理 Orphaned LCCs
-        orphaned_mask = self.orphanedCRU & (self.orphanLCCidx >= 0)
-        if cp.any(orphaned_mask):
-            idx = cp.where(orphaned_mask)[0]
-            # 这里使用了 orphanLCCidx 作为目标索引
-            # 注意：如果多个 LCC 注入同一个 voxel，这里需要 atomic add
-            # cp.add.at(cm, self.orphanLCCidx[idx], dt * self.Ilcc[idx] / 5.0)
-            # 简单起见：
-            targets = self.orphanLCCidx[idx]
-            values = dt * self.Ilcc[idx] / 5.0
-            cp.scatter_add(cm, targets, values)
-
-        removed_mask = self.orphanedCRU & (self.orphanLCCidx < 0)
-        self.Ilcc[removed_mask] = 0.0
+        # 3. 计算通量并更新 (CruFluxKernel)
+        grid = (self.n_cru + 255) // 256
+        flux_kernel(
+            (grid,), (256,),
+            (
+                self.cd, self.cj, self.Ilcc,
+                cm, cs,
+                self.networkIdx,
+                self.RyRs.Nr, self.LCCs.Nl,
+                cp.float32(v_val), cp.float32(dt),
+                cp.bool_(fix_sr), cp.int32(self.n_cru)
+            )
+        )
 
     def to_numpy(self):
         return {
             'cd': cp.asnumpy(self.cd),
             'cj': cp.asnumpy(self.cj),
-            'Ilcc': cp.asnumpy(self.Ilcc),
-            'networkIdx': cp.asnumpy(self.networkIdx),
-            'RyR_Nr': cp.asnumpy(self.RyRs.Nr),
-            'RyR_Nrc': cp.asnumpy(self.RyRs.Nrc),
-            'LCC_Nl': cp.asnumpy(self.LCCs.Nl),
-            'LCC_Nlc': cp.asnumpy(self.LCCs.Nlc)
+            'Ilcc': cp.asnumpy(self.Ilcc)
         }
 
     def from_numpy(self, data):
         self.cd = cp.asarray(data['cd'], dtype=cp.float32)
         self.cj = cp.asarray(data['cj'], dtype=cp.float32)
         self.Ilcc = cp.asarray(data['Ilcc'], dtype=cp.float32)
-        self.networkIdx = cp.asarray(data['networkIdx'], dtype=cp.int32)
-        self.RyRs.Nr = cp.asarray(data['RyR_Nr'], dtype=cp.int32)
-        self.RyRs.Nrc = cp.asarray(data['RyR_Nrc'], dtype=cp.int32)
-        self.LCCs.Nl = cp.asarray(data['LCC_Nl'], dtype=cp.int32)
-        self.LCCs.Nlc = cp.asarray(data['LCC_Nlc'], dtype=cp.int32)
