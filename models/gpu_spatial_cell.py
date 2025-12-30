@@ -24,7 +24,7 @@ class GPUSpatialCell:
     def __init__(self, nx, ny, nz, filename, rng_seed):
         self.nx, self.ny, self.nz = nx, ny, nz
         self.n_cru = nx * ny * nz
-        
+
         # 细分网格参数 (每个 CRU 包含 5x5x5 个肌浆体素)
         NX_MYO_SCALE = 5
         self.nx_myo = nx * NX_MYO_SCALE
