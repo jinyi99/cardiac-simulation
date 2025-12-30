@@ -4,12 +4,12 @@ import time
 from .gpu_myocyte import GPUMyocyteCalcium
 from .gpu_cru import GPUCRU
 from .gpu_ucla_cell import GPUUCLACell
-# 导入融合内核
-from .kernels_fused import fused_reaction_kernel
+# 导入新的扩散内核
+from .kernels_fused import fused_reaction_kernel, diffusion_kernel_3d
 
 
 class GPUSpatialCell:
-    """空间心肌细胞模型类（GPU版本 - 高性能优化版）"""
+    """空间心肌细胞模型类（GPU版本 - 极致性能优化版）"""
 
     # 模型参数
     DT = 0.01  # 时间步长 (ms)
@@ -24,7 +24,13 @@ class GPUSpatialCell:
     def __init__(self, nx, ny, nz, filename, rng_seed):
         self.nx, self.ny, self.nz = nx, ny, nz
         self.n_cru = nx * ny * nz
-        self.n_myo_voxels = nx * ny * nz * 5 ** 3  # NX_MYO=5
+        
+        # 细分网格参数 (每个 CRU 包含 5x5x5 个肌浆体素)
+        NX_MYO_SCALE = 5
+        self.nx_myo = nx * NX_MYO_SCALE
+        self.ny_myo = ny * NX_MYO_SCALE
+        self.nz_myo = nz * NX_MYO_SCALE
+        self.n_myo_voxels = self.nx_myo * self.ny_myo * self.nz_myo
 
         self.dt = self.DT
         self.time = 0.0
@@ -36,6 +42,7 @@ class GPUSpatialCell:
 
         # 初始化模型组件
         self.whole_cell = GPUUCLACell(1)
+        # 注意：这里假设是一个大的空间分布细胞
         self.myosr_ca = [GPUMyocyteCalcium(self.n_myo_voxels) for _ in range(1)]
         self.crus = [GPUCRU(self.n_cru) for _ in range(1)]
 
@@ -44,22 +51,13 @@ class GPUSpatialCell:
         self.Istim = cp.zeros(1, dtype=cp.float32)
         self.fix_sr = False
 
-        # 定义扩散计算内核
-        self.diffusion_kernel = cp.ElementwiseKernel(
-            'float32 dt, float32 D, float32 dx, float32 c, float32 c_left, float32 c_right, float32 beta',
-            'float32 result',
-            '''
-            float diffusion = D * dt / (dx * dx) * (c_left - 2.0f * c + c_right);
-            result = c + diffusion / beta;
-            ''',
-            'diffusion_calculation'
-        )
-
-        # 内核启动参数预计算
+        # --- GPU 内核启动配置 ---
         self.block_size = 256
         self.grid_size = (self.n_myo_voxels + self.block_size - 1) // self.block_size
 
-        print(f"初始化完成: {nx}x{ny}x{nz} CRU网格, {self.n_myo_voxels} 个体素 (优化版)")
+        print(f"初始化完成: {nx}x{ny}x{nz} CRU网格")
+        print(f"细分网格: {self.nx_myo}x{self.ny_myo}x{self.nz_myo} ({self.n_myo_voxels} 体素)")
+        print("优化策略: CUDA Graph + Fused Reaction + 3D Native Diffusion")
 
     def _init_gpu_arrays(self):
         cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
@@ -87,21 +85,17 @@ class GPUSpatialCell:
         stim_steps = int(stim_duration / self.dt)
 
         # Graph 配置
-        GRAPH_BATCH_SIZE = 100  # 每次 Graph 执行 100 步
+        GRAPH_BATCH_SIZE = 100  # 增大 Batch Size 以减少 Python 开销
         graph = None
         graph_stream = cp.cuda.Stream(non_blocking=True)
 
         step = 0
         while step < n_steps:
-            # 判断是否可以使用 Graph：
-            # 1. 剩余步数足够一个 Batch
-            # 2. 当前不在刺激期（刺激期可能有逻辑变动，且时间短，用普通循环处理更安全）
             use_graph = (n_steps - step >= GRAPH_BATCH_SIZE) and (step >= stim_steps)
 
             if use_graph:
                 if graph is None:
                     # === 录制 CUDA Graph ===
-                    # 注意：录制时所有 GPU 操作会被捕获，Python 逻辑会执行
                     graph_stream.begin_capture()
                     for _ in range(GRAPH_BATCH_SIZE):
                         self._step_logic(istim_val=0.0, istim_on=False, vclamp=vclamp)
@@ -109,24 +103,16 @@ class GPUSpatialCell:
 
                 # === 执行 Graph ===
                 graph.launch(stream=cp.cuda.get_current_stream())
-
-                # 更新 Python 侧状态 (Graph 内部不会更新 Python 变量)
                 self.time += self.dt * GRAPH_BATCH_SIZE
                 step += GRAPH_BATCH_SIZE
 
-                # 检查输出
-                # 注意：这里简化处理，只在 Batch 结束时检查输出
                 if step % self.REDUCE_OUTPUT == 0:
                     self.output_data(step)
 
             else:
-                # === 普通执行模式 (处理刺激期或剩余步数) ===
+                # === 普通执行模式 ===
                 istim_on = step < stim_steps
-
-                # 如果 istim 是数组，需要处理；如果是标量直接传
-                # 这里假设 istim 是标量或只在 stim_on 时有效
                 curr_istim = istim if istim_on else 0.0
-
                 self._step_logic(curr_istim, istim_on, vclamp)
                 self.time += self.dt
                 step += 1
@@ -135,14 +121,14 @@ class GPUSpatialCell:
                     self.output_data(step)
 
     def _step_logic(self, istim_val, istim_on, vclamp):
-        """单步物理逻辑 (供循环和 Graph 录制共用)"""
+        """单步物理逻辑"""
         # 1. Update CRU Flux
         self.update_cru_flux()
 
         # 2. Update MyoSR Flux (使用融合内核)
         self.update_myosr_flux()
 
-        # 3. Diffusion
+        # 3. Diffusion (使用新的 3D 内核)
         self.compute_calcium_diffusion()
 
         # 4. Voltage
@@ -161,7 +147,6 @@ class GPUSpatialCell:
 
     def update_myosr_flux(self):
         """更新肌浆网通量 - 使用融合内核"""
-        # 直接调用 C++ 内核，避免 Python 计算
         myosr = self.myosr_ca[0]
         fused_reaction_kernel(
             (self.grid_size,), (self.block_size,),
@@ -174,64 +159,54 @@ class GPUSpatialCell:
         )
 
     def compute_calcium_diffusion(self):
+        """
+        计算钙扩散 - 使用完全向量化的 CUDA C++ 内核
+        """
         for myosr in self.myosr_ca:
+            # 1. 计算缓冲系数 (仍使用 elementwise，因公式复杂且独立)
+            # 如果想进一步优化，可以将 buffering 也融合进 diffusion kernel
             beta_m = myosr.compute_buffering_m(myosr.cm)
             beta_s = myosr.compute_buffering_sr(myosr.cs)
 
-            # 简单的移位操作实现邻居访问 (比切片拷贝更快)
-            cm_left = cp.roll(myosr.cm, 1)
-            cm_right = cp.roll(myosr.cm, -1)
-            # 修正边界 (cp.roll 是循环移位，需截断)
-            # 注意：实际扩散内核可能需要更严谨的边界处理，此处保持原逻辑兼容性
-            # 为保持与原代码一致的切片逻辑：
-            # 原代码: cm_left[1:] = cm[:-1], cm_left[0]=0 (implicit in zeros_like)
-
-            # 优化：为了适配 Graph，这里使用原代码逻辑的变量构造，
-            # 但如果想要极致速度，建议完全移入 C++ 内核。
-            # 这里保留原逻辑以确保数值正确性。
-            cm_L = cp.zeros_like(myosr.cm)
-            cm_L[1:] = myosr.cm[:-1]
-            cm_R = cp.zeros_like(myosr.cm)
-            cm_R[:-1] = myosr.cm[1:]
-
-            cs_L = cp.zeros_like(myosr.cs)
-            cs_L[1:] = myosr.cs[:-1]
-            cs_R = cp.zeros_like(myosr.cs)
-            cs_R[:-1] = myosr.cs[1:]
-
-            myosr.cm_tmp = self.diffusion_kernel(
-                self.dt, self.D_M, self.DX,
-                myosr.cm, cm_L, cm_R, beta_m
+            # 2. 计算肌浆钙 (Cm) 扩散
+            # 参数: (c_out, c_in, beta, dt, D, dx, nx, ny, nz)
+            diffusion_kernel_3d(
+                (self.grid_size,), (self.block_size,),
+                (
+                    myosr.cm_tmp, myosr.cm, beta_m,
+                    cp.float32(self.dt), cp.float32(self.D_M), cp.float32(self.DX),
+                    cp.int32(self.nx_myo), cp.int32(self.ny_myo), cp.int32(self.nz_myo)
+                )
             )
 
-            myosr.cs_tmp = self.diffusion_kernel(
-                self.dt, self.D_SR, self.DX,
-                myosr.cs, cs_L, cs_R, beta_s
+            # 3. 计算肌浆网钙 (Cs) 扩散
+            diffusion_kernel_3d(
+                (self.grid_size,), (self.block_size,),
+                (
+                    myosr.cs_tmp, myosr.cs, beta_s,
+                    cp.float32(self.dt), cp.float32(self.D_SR), cp.float32(self.DX),
+                    cp.int32(self.nx_myo), cp.int32(self.ny_myo), cp.int32(self.nz_myo)
+                )
             )
 
+            # 交换指针 (Current <-> Temp)
             myosr.swap_temp_ptr()
 
     def update_voltage(self, istim, istim_on, vclamp=False):
-        # 确保 istim 是标量或正确的数组类型
         current_istim = istim if istim_on else 0.0
-
-        # 调用 whole_cell 的 step
-        # 注意：step 内部是融合内核，本身很快
         self.whole_cell.step(self.dt, current_istim)
 
         if vclamp and hasattr(self, 'VClampArray'):
-            # 电压钳逻辑稍微复杂，如果在 Graph 中使用需确保索引正确
-            # 这里的简化实现假设 Graph 仅用于非钳位或简单模式
             clamp_idx = min(int(self.time / self.dt), len(self.VClampArray) - 1)
             self.whole_cell.v[0] = self.VClampArray[clamp_idx]
 
     def output_data(self, step):
-        avg_data = self.get_averages()
+        # 减少数据回传频率，仅用于监控
         if step % (10 * self.REDUCE_OUTPUT) == 0:
-            print(f"t={self.time:.2f}ms, V={avg_data['v']:.2f}mV, [Ca]i={avg_data['ci']:.4f}μM")
+            avg_data = self.get_averages()
+            print(f"t={self.time:.2f}ms, V={avg_data['v']:.2f}mV, [Ca]i={avg_data['ci']:.4f}uM")
 
     def get_averages(self):
-        # 计算平均值
         avg_cm = cp.mean(self.myosr_ca[0].cm)
         avg_cs = cp.mean(self.myosr_ca[0].cs)
         avg_jncx = cp.mean(self.myosr_ca[0].Jncx)
@@ -250,7 +225,7 @@ class GPUSpatialCell:
             'ILCC': float(avg_ilcc)
         }
 
-    # 其他辅助方法保持不变...
+    # 数据IO辅助方法
     def load_vclamp_data(self, filename):
         try:
             data = np.loadtxt(filename)
