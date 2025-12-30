@@ -13,7 +13,7 @@ class DefaultParams:
     # 时间参数
     DT = 0.01  # 时间步长 (ms)
     OUTPUT_DT = 1.0  # 输出间隔 (ms)
-    SIMULATION_DURATION = 1000.0  # 默认模拟时长 (ms)
+    SIMULATION_DURATION = 600.0  # 默认模拟时长 (ms)
 
     # 空间参数
     NX = 10  # X方向CRU数量
