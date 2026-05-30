@@ -1,0 +1,137 @@
+nohup: ignoring input
+正在初始化多脉冲 GPU 环境...
+初始化完成: 10x20x10 CRU网格
+细分网格: 50x100x50 (250000 体素)
+优化策略: CUDA Graph + Fused Reaction + 3D Native Diffusion
+未找到预训练模型，将从头开始初始化模型...
+Using cuda device
+============================================================
+开始多脉冲刺激训练 (Multi-Pulse Stimulation Training)...
+当前策略：绝对公平能量评价 (Absolute Charge Energy) - 单进程模式
+============================================================
+Logging to ./logs_multipulse/SAC_19
+---------------------------------
+| rollout/           |          |
+|    ep_len_mean     | 100      |
+|    ep_rew_mean     | 4.8e+03  |
+| time/              |          |
+|    episodes        | 4        |
+|    fps             | 0        |
+|    time_elapsed    | 7971     |
+|    total_timesteps | 400      |
+| train/             |          |
+|    actor_loss      | -14.8    |
+|    critic_loss     | 0.0371   |
+|    ent_coef        | 0.699    |
+|    ent_coef_loss   | -2.42    |
+|    learning_rate   | 0.0003   |
+|    n_updates       | 1196     |
+---------------------------------
+---------------------------------
+| rollout/           |          |
+|    ep_len_mean     | 100      |
+|    ep_rew_mean     | 5.31e+03 |
+| time/              |          |
+|    episodes        | 8        |
+|    fps             | 0        |
+|    time_elapsed    | 21726    |
+|    total_timesteps | 800      |
+| train/             |          |
+|    actor_loss      | -23.6    |
+|    critic_loss     | 0.0307   |
+|    ent_coef        | 0.432    |
+|    ent_coef_loss   | -5.64    |
+|    learning_rate   | 0.0003   |
+|    n_updates       | 2796     |
+---------------------------------
+---------------------------------
+| rollout/           |          |
+|    ep_len_mean     | 100      |
+|    ep_rew_mean     | 5.76e+03 |
+| time/              |          |
+|    episodes        | 12       |
+|    fps             | 0        |
+|    time_elapsed    | 34369    |
+|    total_timesteps | 1200     |
+| train/             |          |
+|    actor_loss      | -28      |
+|    critic_loss     | 0.0178   |
+|    ent_coef        | 0.268    |
+|    ent_coef_loss   | -8.85    |
+|    learning_rate   | 0.0003   |
+|    n_updates       | 4396     |
+---------------------------------
+---------------------------------
+| rollout/           |          |
+|    ep_len_mean     | 100      |
+|    ep_rew_mean     | 6.02e+03 |
+| time/              |          |
+|    episodes        | 16       |
+|    fps             | 0        |
+|    time_elapsed    | 39856    |
+|    total_timesteps | 1600     |
+| train/             |          |
+|    actor_loss      | -29.8    |
+|    critic_loss     | 0.0132   |
+|    ent_coef        | 0.166    |
+|    ent_coef_loss   | -12      |
+|    learning_rate   | 0.0003   |
+|    n_updates       | 5996     |
+---------------------------------
+---------------------------------
+| rollout/           |          |
+|    ep_len_mean     | 100      |
+|    ep_rew_mean     | 6.19e+03 |
+| time/              |          |
+|    episodes        | 20       |
+|    fps             | 0        |
+|    time_elapsed    | 46071    |
+|    total_timesteps | 2000     |
+| train/             |          |
+|    actor_loss      | -30      |
+|    critic_loss     | 0.0099   |
+|    ent_coef        | 0.103    |
+|    ent_coef_loss   | -15      |
+|    learning_rate   | 0.0003   |
+|    n_updates       | 7596     |
+---------------------------------
+---------------------------------
+| rollout/           |          |
+|    ep_len_mean     | 100      |
+|    ep_rew_mean     | 6.57e+03 |
+| time/              |          |
+|    episodes        | 24       |
+|    fps             | 0        |
+|    time_elapsed    | 50741    |
+|    total_timesteps | 2400     |
+| train/             |          |
+|    actor_loss      | -29.3    |
+|    critic_loss     | 0.008    |
+|    ent_coef        | 0.0638   |
+|    ent_coef_loss   | -17.9    |
+|    learning_rate   | 0.0003   |
+|    n_updates       | 9196     |
+---------------------------------
+---------------------------------
+| rollout/           |          |
+|    ep_len_mean     | 100      |
+|    ep_rew_mean     | 6.97e+03 |
+| time/              |          |
+|    episodes        | 28       |
+|    fps             | 0        |
+|    time_elapsed    | 55012    |
+|    total_timesteps | 2800     |
+| train/             |          |
+|    actor_loss      | -28.1    |
+|    critic_loss     | 0.00539  |
+|    ent_coef        | 0.0399   |
+|    ent_coef_loss   | -19.8    |
+|    learning_rate   | 0.0003   |
+|    n_updates       | 10796    |
+---------------------------------
+ 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3,000/3,000  [ 15:48:31 < 0:00:00 , 0 it/s ]
+/home/xp/miniconda3/lib/python3.8/site-packages/gymnasium/spaces/box.py:235: UserWarning: [33mWARN: Box low's precision lowered by casting to float32, current low.dtype=float64[0m
+  gym.logger.warn(
+/home/xp/miniconda3/lib/python3.8/site-packages/gymnasium/spaces/box.py:305: UserWarning: [33mWARN: Box high's precision lowered by casting to float32, current high.dtype=float64[0m
+  gym.logger.warn(
+训练完成！模型及归一化文件已保存至 ./checkpoints_multipulse/。
